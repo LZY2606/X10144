@@ -2686,51 +2686,68 @@ fn cjk_friendly_underscore_delim_run_flanking(
     }
 }
 
+/// Bytes that can always start a special inline structure, regardless of
+/// enabled extensions.
+const STANDARD_SPECIAL_BYTES: &[u8] = &[
+    b'\n', b'\r', b'*', b'_', b'&', b'\\', b'[', b']', b'<', b'!', b'`', b'\0',
+];
+
+/// Single declarative source mapping an `Options` flag to the extra bytes it
+/// makes special. A byte listed under several flags stays special as long as
+/// any one of those flags is enabled, and is dropped from the hot-path set as
+/// soon as the last of them is disabled. Both the scalar and the SIMD lookup
+/// tables are derived from this declaration, so the two scan paths can never
+/// disagree about the candidate set.
+const OPTION_SPECIAL_BYTES: &[(Options, &[u8])] = &[
+    (Options::ENABLE_TABLES, &[b'|']),
+    (Options::ENABLE_STRIKETHROUGH, &[b'~']),
+    (Options::ENABLE_SUBSCRIPT, &[b'~']),
+    (Options::ENABLE_SUPERSCRIPT, &[b'^']),
+    (Options::ENABLE_HIGHLIGHT, &[b'=']),
+    (Options::ENABLE_MATH, &[b'$', b'{', b'}']),
+    (Options::ENABLE_SMART_PUNCTUATION, &[b'.', b'-', b'"', b'\'']),
+];
+
+#[cfg(all(test, feature = "std"))]
+thread_local! {
+    /// Counts how many times the lookup table was (re)built. Used by tests to
+    /// guarantee the table is computed once per parser, not per scanned byte.
+    static LUT_BUILD_COUNT: core::cell::Cell<usize> = core::cell::Cell::new(0);
+}
+
 fn create_lut(options: &Options) -> LookupTable {
+    #[cfg(all(test, feature = "std"))]
+    LUT_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+
+    let scalar = special_bytes(options);
     #[cfg(all(target_arch = "x86_64", feature = "simd"))]
     {
         LookupTable {
-            simd: simd::compute_lookup(options),
-            scalar: special_bytes(options),
+            simd: simd::compute_lookup(&scalar),
+            scalar,
         }
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
     {
-        special_bytes(options)
+        scalar
     }
 }
 
+/// Computes the canonical special-byte set for the given options from
+/// [`STANDARD_SPECIAL_BYTES`] and [`OPTION_SPECIAL_BYTES`]. This is the single
+/// source of truth that both scan paths consume; it runs once per parser, so
+/// it must stay allocation-free and is never consulted in the scan loop.
 fn special_bytes(options: &Options) -> [bool; 256] {
     let mut bytes = [false; 256];
-    let standard_bytes = [
-        b'\n', b'\r', b'*', b'_', b'&', b'\\', b'[', b']', b'<', b'!', b'`', b'\0',
-    ];
 
-    for &byte in &standard_bytes {
+    for &byte in STANDARD_SPECIAL_BYTES {
         bytes[byte as usize] = true;
     }
-    if options.contains(Options::ENABLE_TABLES) {
-        bytes[b'|' as usize] = true;
-    }
-    if options.contains(Options::ENABLE_STRIKETHROUGH)
-        || options.contains(Options::ENABLE_SUBSCRIPT)
-    {
-        bytes[b'~' as usize] = true;
-    }
-    if options.contains(Options::ENABLE_SUPERSCRIPT) {
-        bytes[b'^' as usize] = true;
-    }
-    if options.contains(Options::ENABLE_HIGHLIGHT) {
-        bytes[b'=' as usize] = true;
-    }
-    if options.contains(Options::ENABLE_MATH) {
-        bytes[b'$' as usize] = true;
-        bytes[b'{' as usize] = true;
-        bytes[b'}' as usize] = true;
-    }
-    if options.contains(Options::ENABLE_SMART_PUNCTUATION) {
-        for &byte in &[b'.', b'-', b'"', b'\''] {
-            bytes[byte as usize] = true;
+    for &(flag, marker_bytes) in OPTION_SPECIAL_BYTES {
+        if options.contains(flag) {
+            for &byte in marker_bytes {
+                bytes[byte as usize] = true;
+            }
         }
     }
 
@@ -2755,7 +2772,8 @@ type LookupTable = [bool; 256];
 
 /// This function walks the byte slices from the given index and
 /// calls the callback function on all bytes (and their indices) that are in the
-/// special-bytes set defined by [`special_bytes`]/[`simd::compute_lookup`].
+/// special-bytes set defined by [`special_bytes`] (from which the SIMD table
+/// used on `x86_64` with the `simd` feature is derived).
 /// The always-included bytes are
 /// `` ` ``, `\`, `&`, `*`, `_`, `!`, `<`, `[`, `]`, `\r`, `\n`, `\0`; additional bytes
 /// are added when their corresponding option is enabled (e.g. `|` with tables,
@@ -2932,7 +2950,8 @@ mod simd {
     //!
     //! This module provides functions that allow walking through byteslices, calling
     //! provided callback functions on special bytes and their indices using SIMD.
-    //! The byteset is defined in `compute_lookup`.
+    //! The byteset is defined canonically by [`super::special_bytes`];
+    //! `compute_lookup` merely re-encodes that set as a nibble bitmap.
     //!
     //! The idea is to load in a chunk of 16 bytes and perform a lookup into a set of
     //! bytes on all the bytes in this chunk simultaneously. We produce a 16 bit bitmask
@@ -2949,45 +2968,24 @@ mod simd {
     use core::arch::x86_64::*;
 
     use super::{LookupTable, LoopInstruction};
-    use crate::Options;
 
     const VECTOR_SIZE: usize = core::mem::size_of::<__m128i>();
 
-    /// Generates a lookup table containing the bitmaps for our
-    /// special marker bytes. This is effectively a 128 element 2d bitvector,
-    /// that can be indexed by a four bit row index (the lower nibble)
-    /// and a three bit column index (upper nibble).
-    pub(super) fn compute_lookup(options: &Options) -> [u8; 16] {
+    /// Re-encodes the canonical special-byte set (see [`super::special_bytes`])
+    /// as a lookup table containing the bitmaps for our special marker bytes.
+    /// This is effectively a 128 element 2d bitvector, that can be indexed by a
+    /// four bit row index (the lower nibble) and a three bit column index
+    /// (upper nibble).
+    pub(super) fn compute_lookup(special_bytes: &[bool; 256]) -> [u8; 16] {
         let mut lookup = [0u8; 16];
-        let standard_bytes = [
-            b'\n', b'\r', b'*', b'_', b'&', b'\\', b'[', b']', b'<', b'!', b'`', b'\0',
-        ];
 
-        for &byte in &standard_bytes {
-            add_lookup_byte(&mut lookup, byte);
-        }
-        if options.contains(Options::ENABLE_TABLES) {
-            add_lookup_byte(&mut lookup, b'|');
-        }
-        if options.contains(Options::ENABLE_STRIKETHROUGH)
-            || options.contains(Options::ENABLE_SUBSCRIPT)
-        {
-            add_lookup_byte(&mut lookup, b'~');
-        }
-        if options.contains(Options::ENABLE_SUPERSCRIPT) {
-            add_lookup_byte(&mut lookup, b'^');
-        }
-        if options.contains(Options::ENABLE_HIGHLIGHT) {
-            add_lookup_byte(&mut lookup, b'=');
-        }
-        if options.contains(Options::ENABLE_MATH) {
-            add_lookup_byte(&mut lookup, b'$');
-            add_lookup_byte(&mut lookup, b'{');
-            add_lookup_byte(&mut lookup, b'}');
-        }
-        if options.contains(Options::ENABLE_SMART_PUNCTUATION) {
-            for &byte in &[b'.', b'-', b'"', b'\''] {
-                add_lookup_byte(&mut lookup, byte);
+        for (byte, &is_special) in special_bytes.iter().enumerate() {
+            if is_special {
+                // The nibble bitmap can only represent ASCII bytes; the
+                // canonical set must never contain non-ASCII bytes (this is
+                // verified exhaustively by the test suite).
+                debug_assert!(byte < 0x80);
+                add_lookup_byte(&mut lookup, byte as u8);
             }
         }
 
@@ -3197,5 +3195,380 @@ mod simd {
                 }
             }
         }
+
+        /// Drives the real SIMD scan loop directly (bypassing the length and
+        /// feature dispatch) and checks it against the scalar scan on
+        /// generated inputs for every relevant option combination.
+        #[test]
+        fn forced_simd_scan_matches_scalar() {
+            if !is_x86_feature_detected!("ssse3") {
+                return;
+            }
+            let inputs = crate::firstpass::special_bytes_tests::generated_scan_inputs();
+            for options in crate::firstpass::special_bytes_tests::test_option_combos() {
+                let scalar = crate::firstpass::special_bytes(&options);
+                let lut = super::compute_lookup(&scalar);
+                for bytes in inputs.iter().filter(|b| b.len() >= super::VECTOR_SIZE) {
+                    let expected =
+                        crate::firstpass::special_bytes_tests::collect_scalar_candidates(
+                            &scalar, bytes,
+                        );
+                    let mut actual = alloc::vec::Vec::new();
+                    unsafe {
+                        super::simd_iterate_special_bytes::<_, ()>(&lut, bytes, 0, |ix, _| {
+                            actual.push(ix);
+                            LoopInstruction::ContinueAndSkip(0)
+                        });
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "SIMD and scalar scans disagree on {bytes:?} with options {options:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod special_bytes_tests {
+    //! Systematic tests pinning the single source of truth for the
+    //! option-dependent special-byte set: the canonical declaration, the
+    //! scalar lookup table and the SIMD lookup table must agree for every
+    //! option combination and every byte, and both scan paths must report the
+    //! same candidate positions on generated inputs.
+
+    use super::*;
+    use crate::{Event, Parser, Tag};
+
+    /// Option flags that influence the special-byte set.
+    const TESTED_OPTION_FLAGS: [Options; 7] = [
+        Options::ENABLE_TABLES,
+        Options::ENABLE_STRIKETHROUGH,
+        Options::ENABLE_SUBSCRIPT,
+        Options::ENABLE_SUPERSCRIPT,
+        Options::ENABLE_HIGHLIGHT,
+        Options::ENABLE_MATH,
+        Options::ENABLE_SMART_PUNCTUATION,
+    ];
+
+    /// Iterates all 2^7 combinations of the option flags that influence the
+    /// special-byte set.
+    pub(super) fn test_option_combos() -> impl Iterator<Item = Options> {
+        (0..(1u32 << TESTED_OPTION_FLAGS.len())).map(|bits| {
+            let mut options = Options::empty();
+            for (i, &flag) in TESTED_OPTION_FLAGS.iter().enumerate() {
+                if bits & (1 << i) != 0 {
+                    options |= flag;
+                }
+            }
+            options
+        })
+    }
+
+    /// The expected special-byte set, derived directly from the declarations
+    /// (`STANDARD_SPECIAL_BYTES`/`OPTION_SPECIAL_BYTES`).
+    fn expected_special_bytes(options: &Options) -> [bool; 256] {
+        let mut expected = [false; 256];
+        for &byte in STANDARD_SPECIAL_BYTES {
+            expected[byte as usize] = true;
+        }
+        for &(flag, marker_bytes) in OPTION_SPECIAL_BYTES {
+            if options.contains(flag) {
+                for &byte in marker_bytes {
+                    expected[byte as usize] = true;
+                }
+            }
+        }
+        expected
+    }
+
+    /// Membership test for the packed SIMD lookup table.
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    fn simd_lut_contains(lut: &[u8; 16], byte: u8) -> bool {
+        // The packed table can only represent ASCII bytes.
+        byte < 0x80 && (lut[(byte & 0x0f) as usize] >> (byte >> 4)) & 1 == 1
+    }
+
+    /// Deterministic pseudo-random inputs mixing every byte that can be
+    /// special under some option with filler and non-ASCII bytes.
+    pub(super) fn generated_scan_inputs() -> Vec<Vec<u8>> {
+        const ALPHABET: &[u8] = b"\n\r*_&\\[]<!`\0~^|=$.\"'{}-ab \t\xc3\xa9\xffz";
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut inputs = Vec::new();
+        for len in 0..=40usize {
+            for _ in 0..6 {
+                inputs.push(
+                    (0..len)
+                        .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                        .collect(),
+                );
+            }
+        }
+        // Dense-marker inputs to stress skip and tail handling at and around
+        // the 16-byte SIMD vector boundary.
+        for len in 14..=34usize {
+            inputs.push((0..len).map(|i| ALPHABET[i % 17]).collect());
+        }
+        inputs
+    }
+
+    /// Collects every candidate index reported by the scalar scan path.
+    pub(super) fn collect_scalar_candidates(lut: &[bool; 256], bytes: &[u8]) -> Vec<usize> {
+        let mut indices = Vec::new();
+        scalar_iterate_special_bytes::<_, ()>(lut, bytes, 0, |ix, _| {
+            indices.push(ix);
+            LoopInstruction::ContinueAndSkip(0)
+        });
+        indices
+    }
+
+    #[cfg(test)]
+    fn scalar_lut_of(lut: &LookupTable) -> &[bool; 256] {
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        {
+            &lut.scalar
+        }
+        #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+        {
+            lut
+        }
+    }
+
+    /// For every relevant option combination and every byte in 0..=255, the
+    /// canonical declaration, the scalar lookup table and the SIMD lookup
+    /// table must agree.
+    #[test]
+    fn canonical_scalar_and_simd_sets_agree_for_all_option_combos() {
+        for options in test_option_combos() {
+            let expected = expected_special_bytes(&options);
+            let scalar = special_bytes(&options);
+            #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+            let simd = simd::compute_lookup(&scalar);
+
+            for byte in 0u8..=255 {
+                let want = expected[byte as usize];
+                assert_eq!(
+                    scalar[byte as usize], want,
+                    "scalar lookup mismatch for byte {byte:#04x} with options {options:?}"
+                );
+                #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+                assert_eq!(
+                    simd_lut_contains(&simd, byte),
+                    want,
+                    "SIMD lookup mismatch for byte {byte:#04x} with options {options:?}"
+                );
+            }
+        }
+    }
+
+    /// The packed SIMD table can only represent ASCII bytes, so the declared
+    /// special-byte set must never contain non-ASCII bytes.
+    #[test]
+    fn declared_special_bytes_are_ascii() {
+        for &byte in STANDARD_SPECIAL_BYTES {
+            assert!(byte < 0x80, "non-ASCII standard special byte {byte:#04x}");
+        }
+        for &(flag, marker_bytes) in OPTION_SPECIAL_BYTES {
+            for &byte in marker_bytes {
+                assert!(
+                    byte < 0x80,
+                    "non-ASCII special byte {byte:#04x} declared for {flag:?}"
+                );
+            }
+        }
+    }
+
+    /// The dispatched scan path and the scalar scan path must return the same
+    /// candidate positions (in particular the same first candidate) for every
+    /// option combination on generated inputs.
+    #[test]
+    fn dispatched_scan_matches_scalar_scan() {
+        let inputs = generated_scan_inputs();
+        for options in test_option_combos() {
+            let lut = create_lut(&options);
+            let scalar_lut = scalar_lut_of(&lut);
+            for bytes in &inputs {
+                let expected = collect_scalar_candidates(scalar_lut, bytes);
+                let mut actual = Vec::new();
+                iterate_special_bytes::<_, ()>(&lut, bytes, 0, |ix, _| {
+                    actual.push(ix);
+                    LoopInstruction::ContinueAndSkip(0)
+                });
+                assert_eq!(
+                    actual, expected,
+                    "scan paths disagree on {bytes:?} with options {options:?}"
+                );
+                assert_eq!(
+                    actual.first(),
+                    expected.first(),
+                    "first candidate differs on {bytes:?} with options {options:?}"
+                );
+            }
+        }
+    }
+
+    /// `~` is shared between strikethrough and subscript: it must stay in the
+    /// set while either extension is enabled, and leave the hot path only when
+    /// both are disabled.
+    #[test]
+    fn tilde_shared_by_strikethrough_and_subscript() {
+        let strike = Options::ENABLE_STRIKETHROUGH;
+        let subscript = Options::ENABLE_SUBSCRIPT;
+        assert!(special_bytes(&strike)[b'~' as usize]);
+        assert!(special_bytes(&subscript)[b'~' as usize]);
+        assert!(special_bytes(&(strike | subscript))[b'~' as usize]);
+        assert!(!special_bytes(&Options::empty())[b'~' as usize]);
+
+        // No other tested flag may pull `~` into the set.
+        let mut others = Options::empty();
+        for &flag in &TESTED_OPTION_FLAGS {
+            if flag != strike && flag != subscript {
+                others |= flag;
+            }
+        }
+        assert!(!special_bytes(&others)[b'~' as usize]);
+    }
+
+    /// `$`, `{` and `}` are math-only markers.
+    #[test]
+    fn dollar_and_braces_require_math() {
+        for byte in [b'$', b'{', b'}'] {
+            assert!(special_bytes(&Options::ENABLE_MATH)[byte as usize]);
+            assert!(!special_bytes(&Options::empty())[byte as usize]);
+            let mut others = Options::empty();
+            for &flag in &TESTED_OPTION_FLAGS {
+                if flag != Options::ENABLE_MATH {
+                    others |= flag;
+                }
+            }
+            assert!(!special_bytes(&others)[byte as usize]);
+        }
+    }
+
+    /// `=` belongs to highlight only.
+    #[test]
+    fn equals_requires_highlight() {
+        assert!(special_bytes(&Options::ENABLE_HIGHLIGHT)[b'=' as usize]);
+        assert!(!special_bytes(&Options::empty())[b'=' as usize]);
+        let mut others = Options::empty();
+        for &flag in &TESTED_OPTION_FLAGS {
+            if flag != Options::ENABLE_HIGHLIGHT {
+                others |= flag;
+            }
+        }
+        assert!(!special_bytes(&others)[b'=' as usize]);
+    }
+
+    /// `|` belongs to tables, `^` to superscript.
+    #[test]
+    fn pipe_and_caret_require_their_extensions() {
+        assert!(special_bytes(&Options::ENABLE_TABLES)[b'|' as usize]);
+        assert!(!special_bytes(&Options::empty())[b'|' as usize]);
+        assert!(special_bytes(&Options::ENABLE_SUPERSCRIPT)[b'^' as usize]);
+        assert!(!special_bytes(&Options::empty())[b'^' as usize]);
+    }
+
+    /// Smart punctuation contributes the quote and dash/period markers.
+    #[test]
+    fn smart_punctuation_quotes_and_dashes() {
+        let smart = Options::ENABLE_SMART_PUNCTUATION;
+        for byte in [b'"', b'\'', b'-', b'.'] {
+            assert!(special_bytes(&smart)[byte as usize]);
+            assert!(!special_bytes(&Options::empty())[byte as usize]);
+        }
+        // Each smart punctuation marker must also appear in the scan results.
+        let lut = create_lut(&smart);
+        let bytes = b"a\"b'c-d.e";
+        let candidates = collect_scalar_candidates(scalar_lut_of(&lut), bytes);
+        assert_eq!(candidates, vec![1, 3, 5, 7]);
+    }
+
+    /// The standard bytes are always special; unrelated and non-ASCII bytes
+    /// never are, no matter which extensions are enabled.
+    #[test]
+    fn standard_bytes_always_present_and_unrelated_bytes_never() {
+        for options in test_option_combos() {
+            let set = special_bytes(&options);
+            for &byte in STANDARD_SPECIAL_BYTES {
+                assert!(set[byte as usize], "missing {byte:#04x} for {options:?}");
+            }
+            for byte in [b'a', b'z', b'A', b'0', b'9', b' ', b'\t', 0x80, 0xC3, 0xFF] {
+                assert!(!set[byte as usize], "unexpected {byte:#04x} for {options:?}");
+            }
+        }
+    }
+
+    /// The lookup table must be built once per parser, at initialization, and
+    /// never recomputed while scanning bytes.
+    #[cfg(feature = "std")]
+    #[test]
+    fn lookup_table_is_built_once_per_parser() {
+        let mut text = String::new();
+        for _ in 0..64 {
+            text.push_str(
+                "a ~b~ $c$ =d= \"e\" 'f' -g. h|i ^j^ *k* _l_ &m; \\n [o](p) <q> `r` {s}\u{0}\n\n",
+            );
+        }
+        LUT_BUILD_COUNT.with(|count| count.set(0));
+        let events = Parser::new_ext(&text, Options::all()).count();
+        assert!(events > 0);
+        LUT_BUILD_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "lookup table must be built exactly once per parser, not per byte"
+            );
+        });
+    }
+
+    /// Parse-level regressions: shared markers keep working when enabled
+    /// through either of their extensions, and produce no markup when their
+    /// extensions are disabled.
+    #[test]
+    fn shared_markers_parse_with_either_extension() {
+        let has_start_tag = |text: &str, options: Options, tag: fn(&Tag) -> bool| {
+            Parser::new_ext(text, options).any(|event| match event {
+                Event::Start(ref t) => tag(t),
+                _ => false,
+            })
+        };
+
+        // `~` via strikethrough or subscript.
+        assert!(has_start_tag("~~x~~", Options::ENABLE_STRIKETHROUGH, |t| matches!(t, Tag::Strikethrough)));
+        assert!(has_start_tag("~x~", Options::ENABLE_SUBSCRIPT, |t| matches!(t, Tag::Subscript)));
+        assert!(!has_start_tag("~~x~~", Options::empty(), |t| matches!(t, Tag::Strikethrough)));
+
+        // `=` via highlight.
+        assert!(has_start_tag("==x==", Options::ENABLE_HIGHLIGHT, |t| matches!(t, Tag::Highlight)));
+        assert!(!has_start_tag("==x==", Options::empty(), |t| matches!(t, Tag::Highlight)));
+
+        // `$` via math.
+        assert!(Parser::new_ext("$x$", Options::ENABLE_MATH)
+            .any(|event| matches!(event, Event::InlineMath(_))));
+        assert!(!Parser::new_ext("$x$", Options::empty())
+            .any(|event| matches!(event, Event::InlineMath(_))));
+
+        // Quotes and dashes via smart punctuation.
+        let smart_text: String = Parser::new_ext("\"a\" -- b", Options::ENABLE_SMART_PUNCTUATION)
+            .filter_map(|event| match event {
+                Event::Text(text) => Some(text.into_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(smart_text, "\u{201c}a\u{201d} \u{2013} b");
+        let plain_text: String = Parser::new("\"a\" -- b")
+            .filter_map(|event| match event {
+                Event::Text(text) => Some(text.into_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plain_text, "\"a\" -- b");
     }
 }
